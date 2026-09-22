@@ -1,5 +1,5 @@
 ---
-title: "Bayesian Sampling with Conditional Diffusion Models"
+title: "Sampling with Conditional Diffusion Models"
 author: "Elling Svee"
 date: 2026-09-22
 date-format: "MMMM D, YYYY"
@@ -10,7 +10,33 @@ execute:
   warning: false
 ---
 
-In this post, we explore how to use generative diffusion models to perform Bayesian inference.
+Many problems in science and engineering are inverse problems. We observe indirect or corrupted measurements and want to recover the unknown quantity that generated them. Examples include recovering a signal from incomplete observations, or inferring physical parameters from experimental data. These problems are often ill-posed, meaning that many different solutions may be consistent with the observations.  A natural way to handle this ambiguity is through Bayesian inference. Let $x$ denote the unknown quantity and $y$ the observed data. Bayes' rule gives
+
+$$
+p(\boldsymbol{x} \mid \boldsymbol{y}) \propto p(\boldsymbol{y} \mid \boldsymbol{x})\,p(\boldsymbol{x}),
+$$
+
+where:
+
+* Prior $p(\boldsymbol{x})$: describes what solutions are plausible before observing the data.
+* Likelihood $p(\boldsymbol{y} \mid \boldsymbol{x})$: describes the measurement process and how well a candidate $\boldsymbol{x}$ explains the observations.
+* Posterior $p(\boldsymbol{x} \mid \boldsymbol{y})$: combines both sources of information and represents our uncertainty about $\boldsymbol{x}$ after observing $\boldsymbol{y}$.
+
+The challenge is that useful priors for high-dimensional objects are difficult to specify explicitly. Generative diffusion models provide an attractive alternative. Here, a diffusion model trained on representative data can act as a powerful learned prior. Instead of restricting solutions using a hand-designed regularizer, the model captures complex structure directly from data. By combining this learned prior with the likelihood during the diffusion sampling process, we can approximately sample from the posterior without retraining the generative model for every new inverse problem.
+
+Benefits of using diffusion models as priors include:
+
+* Expressive priors: Can capture complex, high-dimensional distributions that are difficult to model analytically.
+* Reusable prior: A pretrained diffusion model can be combined with different forward models and likelihoods without retraining.
+* High-dimensional inference: Can handle high-dimensional inverse problems where traditional methods may struggle.
+
+However, compared to approaches like MCMC or variational inference, there are also some limitations:
+
+* Computational cost: Posterior sampling may require many neural-network evaluations. There are ways to reduce this, like flow-based methods, but this is not discussed here.
+* Approximate inference: Methods such as DPS generally do not produce exact posterior samples and may introduce bias. We will explore ways to handle this.
+* Prior mismatch: If the true solution differs substantially from the diffusion model's training distribution, the prior can lead to misleading reconstructions.
+* Limited interpretability: A learned generative prior is harder to understand and analyze than simple analytical priors.
+
 
 ```{python}
 import matplotlib.pyplot as plt
@@ -58,29 +84,21 @@ from jax.nn import softmax
 We consider a deliberately simple one-dimensional inverse problem in which all relevant distributions can be computed analytically. This gives us a ground truth against which we can compare the diffusion-based posterior samplers later in the post. The setup is adapted from the Gaussian-mixture example on page 24 of [these lecture notes](https://www.math.emory.edu/~lruthot/workshops/computational-math-ai-2025/slides/lecture09-slides-handout.pdf#page=24).
 
 The unknown state is a scalar $x\in\mathbb{R}$. We assign it a three-component Gaussian-mixture prior,
-
 $$
 p(x)=\sum_{k=1}^3 w_k\,\mathcal{N}(x;\mu_k,\sigma_k^2),
 $$
-
 with component weights, means, and standard deviations
-
 $$
 \mathbf{w}=(0.3,0.5,0.2),\qquad
 \boldsymbol{\mu}=(-2.5,0,1.5),\qquad
 \boldsymbol{\sigma}=(0.3,0.4,0.3).
 $$
-
-The separated modes make the prior simple enough to visualize while retaining the multimodality that makes posterior guidance challenging.
-
-We observe the state through the identity forward operator with additive Gaussian noise,
-
+The separated modes make the prior simple enough to visualize, while retaining the multimodality that makes posterior guidance challenging. We observe the state through the identity forward operator with additive Gaussian noise,
 $$
-y=\mathcal{A}(x)+\eta=x+\eta,\qquad
+y=x+\eta,\qquad
 \eta\sim\mathcal{N}(0,\sigma_y^2).
 $$
-
-Equivalently, the likelihood is $p(y\mid x)=\mathcal{N}(y;x,\sigma_y^2)$. We use the observation $y_{\mathrm{obs}}=0.5$ and noise standard deviation $\sigma_y=0.8$. Bayes' rule then gives
+giving the likelihood is $p(y\mid x)=\mathcal{N}(y;x,\sigma_y^2)$. We use the observation $y_{\mathrm{obs}}=0.5$ and noise standard deviation $\sigma_y=0.8$. Bayes' rule then gives
 
 $$
 p(x\mid y_{\mathrm{obs}})
@@ -111,7 +129,7 @@ w_k\,\mathcal{N}(y_{\mathrm{obs}};\mu_k,\sigma_k^2+\sigma_y^2)
 }.
 $$
 
-For our chosen observation, the posterior weights are approximately $(0.0012,0.8011,0.1977)$. The likelihood therefore almost eliminates the leftmost prior mode at $x=-2.5$, while preserving substantial posterior mass around both remaining modes. This analytically available posterior will serve as the reference distribution in our experiments.
+For our chosen observation, the posterior weights are approximately $(0.0012,0.8011,0.1977)$. The likelihood therefore almost eliminates the leftmost prior mode at $x=-2.5$, while preserving posterior mass around both remaining modes. This analytically available posterior will serve as the reference distribution in our experiments.
 
 ```{python}
 class GaussianMixture(NamedTuple):
@@ -206,26 +224,21 @@ plt.show()
 
 # Prior sampling using a generative diffusion model
 
-
-A diffusion model is defined through a *continuous*-time stochastic process $\mathbf{x}(t)$ governed by a forward *stochastic differential equation* (SDE) on the interval $[0,T]$:
-
+A diffusion model learns a mapping from pure Gaussian noise to a target distribution. Instead of learning this mapping directly, the model is trained to denoise a progressively corrupted version of the target distribution. Formally, the diffusion model is defined through a *continuous*-time stochastic process $\mathbf{x}(t)$ governed by a forward *stochastic differential equation* (SDE) on the interval $[0,T]$:
 $$
 \mathrm{d}\mathbf{x}(t)
 = \mathbf{f}(\mathbf{x}(t),t)\,\mathrm{d}t
 + g(t)\,\mathrm{d}\mathbf{w}(t),
 \qquad \mathbf{x}(0) \sim p_0.
 $$ {#eq-forward-sde}
-
 Here $\mathbf{f}(\cdot,t):\mathbb{R}^D\to\mathbb{R}^D$ is the *drift*, $g(t)\in\mathbb{R}$ is the scalar *diffusion coefficient*, and $\mathbf{w}(t)$ denotes a standard Wiener process. Without too much rigour, a *Wiener process* is a continuous-time stochastic process that starts at zero, has independent increments, and satisfies that for any $s<t$, the increment $\mathbf{w}(t)-\mathbf{w}(s)$ is normally distributed with mean zero and variance $t-s$.
 
-Once $\mathbf{f}$ and $g$ are specified, the forward process is fully determined, describing how the data variable is progressively corrupted through the injection of Gaussian noise. For this post, we focus on a *variance-preserving* SDE, where
-
+Once $\mathbf{f}$ and $g$ are specified, the forward process is fully determined, describing how the data is progressively corrupted through the injection of Gaussian noise. For this post, we focus on a *variance-preserving* SDE, where
 $$
 \mathbf{f}(\mathbf{x},t)=-\frac{1}{2}\beta(t)\mathbf{x},
 \qquad g(t)=\sqrt{\beta(t)},
 $$
-
-with a linear schedule $\beta(t)=\beta_{\min}+\frac{t}{T}(\beta_{\max}-\beta_{\min})$ for some $0<\beta_{\min}<\beta_{\max}$. Discretizing @eq-forward-sde with the Euler--Maruyama method for a small time step $\Delta t$ gives the update rule
+with a linear schedule $\beta(t)=\beta_{\min}+\frac{t}{T}(\beta_{\max}-\beta_{\min})$ for some $0<\beta_{\min}<\beta_{\max}$. At the end of the forward process, the distribution of $\mathbf{x}(T) \approx \mathcal{N}(0,I)$, regardless of the initial distribution $p_0$.  Discretizing @eq-forward-sde with the Euler--Maruyama method for a small time step $\Delta t$ gives the update rule
 
 $$
 \mathbf{x}_{t+\Delta t}
@@ -233,9 +246,7 @@ $$
 +\sqrt{\beta(t)\Delta t}\,\boldsymbol{\epsilon}_t,
 \qquad \boldsymbol{\epsilon}_t\sim\mathcal{N}(0,I).
 $$
-
-Importantly, the forward process is *Markovian*, meaning that the distribution of $\mathbf{x}_{t+\Delta t}$ depends only on $\mathbf{x}_t$ and not on any previous states. We can also derive the distribution of $\mathbf{x}_t\mid\mathbf{x}_0$ as
-
+Although the proof is not provided here, we can also derive the distribution of $\mathbf{x}_t\mid\mathbf{x}_0$ as
 $$
 p_t(\mathbf{x}_t\mid\mathbf{x}_0)
 =\mathcal{N}\!\left(
@@ -244,6 +255,8 @@ p_t(\mathbf{x}_t\mid\mathbf{x}_0)
 \mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}
 \right).
 $$ {#eq-forward-conditional}
+
+This is useful because it allows us to sample from the forward process at any time $t$ without simulating the entire trajectory from $0$ to $t$.
 
 The following plot illustrates how the forward process transforms the prior distribution to a simple Gaussian distribution as $t$ approaches $T$. We plot the distribution over time as a heatmap, with some example trajectories of the forward process on top.
 
@@ -265,12 +278,6 @@ def g(beta_t: float) -> Array:
 def forward_step(x: Array, dt: float, beta_t: float, key: Array) -> Array:
     epsilon = random.normal(key, shape=x.shape)
     return x + f(x, beta_t) * dt + g(beta_t) * jnp.sqrt(dt) * epsilon
-
-
-def reverse_step(x: Array, dt: float, beta_t: float, score: Array, key: Array) -> Array:
-    epsilon = random.normal(key, shape=x.shape)
-    drift = f(x, beta_t) - g(beta_t) ** 2 * score
-    return x - drift * dt + g(beta_t) * jnp.sqrt(dt) * epsilon
 
 
 def diffuse_mixture(
@@ -297,24 +304,6 @@ def sample_forward_process(
         samples = forward_step(samples, dt, beta_t, step_key)
         trajectories.append(samples)
     return key, jnp.stack(trajectories)
-
-
-def sample_reverse_process(
-    key: Array,
-    initial_samples: Array,
-    betas: Array,
-    dt: float,
-    score_function: Callable[[Array, int], Array],
-) -> tuple[Array, Array]:
-    num_steps = len(betas)
-    samples = initial_samples
-    trajectories = [samples]
-    for i in range(num_steps, 0, -1):
-        score = score_function(samples, i)
-        key, step_key = random.split(key)
-        samples = reverse_step(samples, dt, betas[i - 1], score, step_key)
-        trajectories.append(samples)
-    return key, jnp.stack(trajectories[::-1])
 ```
 
 ```{python}
@@ -430,39 +419,56 @@ plot_trajectories(
 )
 ```
 
-Intuitively, we can imagine that if we could run the forward process backwards, we would be able to start from pure noise and recover samples from the prior distribution. The remarkable insight of score-based diffusion models is that, although we cannot reverse individual stochastic trajectories, the distribution over those trajectories is reversible. @anderson_reverse_time_1982 formalizes this by constructing a time-reversed process $\widetilde{\mathbf{x}}(t)$ defined by the SDE
+Intuitively, we can imagine that if we could run the forward process backwards, we would be able to start from pure noise and recover samples from the prior distribution. The insight of score-based diffusion models is that, although we cannot reverse individual stochastic trajectories, the distribution over those trajectories is reversible. @anderson_reverse_time_1982 formalizes this by constructing a time-reversed process $\widetilde{\mathbf{x}}(t)$ defined by the SDE
 
 $$
 \begin{aligned}
 \mathrm{d}\widetilde{\mathbf{x}}(t)
 &=\left[\mathbf{f}(\widetilde{\mathbf{x}}(t),t)
 -g^2(t)\nabla_{\mathbf{x}}\log p_t(\widetilde{\mathbf{x}}(t))\right]\mathrm{d}t
-+g(t)\,\mathrm{d}\widetilde{\mathbf{w}}(t),\\
-\widetilde{\mathbf{x}}(T)&\sim p_{\text{prior}}\approx p_T.
++g(t)\,\mathrm{d}\widetilde{\mathbf{w}}(t),
 \end{aligned}
 $$ {#eq-reverse-sde}
 
-Here $\widetilde{\mathbf{w}}(t)$ denotes a standard Wiener process in reverse time, defined as $\widetilde{\mathbf{w}}(t)=\mathbf{w}(T-t)-\mathbf{w}(T)$. The key term to notice is $\nabla_{\mathbf{x}}\log p_t$, pulling the process towards regions of high probability. For a Gaussian distribution $\mathbf{x}\sim\mathcal{N}(\boldsymbol{\mu},\boldsymbol{\Sigma})$, the score function is given by
-
-$$
-\nabla_{\mathbf{x}}\log p(\mathbf{x})
-=-\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu}).
-$$
-
-Those familiar with MCMC might also notice the similarity to Langevin dynamics [@dunson_hastings_2020]. Discretizing @eq-reverse-sde in a similar manner as for the forward process yields the stochastic updates
+Here $\widetilde{\mathbf{w}}(t)$ denotes a standard Wiener process in reverse time, defined as $\widetilde{\mathbf{w}}(t)=\mathbf{w}(T-t)-\mathbf{w}(T)$.  Those familiar with MCMC might also notice the similarity to Langevin dynamics used in the MALA alghorithm [@dunson_hastings_2020], where the score function $\nabla_{\mathbf{x}}\log p_t$ is used to guide the process towards regions of high probability.  Discretizing @eq-reverse-sde in a similar manner as for the forward process yields the stochastic updates
 
 $$
 \begin{aligned}
 \widetilde{\mathbf{x}}_{t-\Delta t}
 ={}&\widetilde{\mathbf{x}}_t
 -\left[-\frac{1}{2}\beta(t)\widetilde{\mathbf{x}}_t
--\beta(t)\nabla_{\widetilde{\mathbf{x}}_t}\log p_t(\widetilde{\mathbf{x}}_t)\right]\Delta t\\
-&-\sqrt{\beta(t)\Delta t}\,\widetilde{\boldsymbol{\epsilon}}_t,
-\qquad \widetilde{\boldsymbol{\epsilon}}_t\sim\mathcal{N}(0,\mathbf{I}).
+-\beta(t)\nabla_{\widetilde{\mathbf{x}}_t}\log p_t(\widetilde{\mathbf{x}}_t)\right]\Delta t
+-\sqrt{\beta(t)\Delta t}\,\widetilde{\boldsymbol{\epsilon}}_t,
+\quad \widetilde{\boldsymbol{\epsilon}}_t\sim\mathcal{N}(0,\mathbf{I}).
 \end{aligned}
 $$ {#eq-reverse-discrete}
 
-Observe that if we knew the score function $\nabla_{\mathbf{x}}\log p_t$ for all $t$, we could sample from $p_0$ by starting from $p_T\approx p_{\text{noise}}\sim\mathcal{N}(\mathbf{0},\mathbf{I})$ and iteratively applying the updates above. For our simple multimodal example, we can compute the score function analytically.
+Observe that the score $\nabla_{\mathbf{x}}\log p_t$ is the only term that depends on the unknown distribution $p_t$. If we knew it for all $t$, we could sample from $p_0$ by starting from $p_T\approx \mathcal{N}(\mathbf{0},\mathbf{I})$ and iteratively applying the updates above. For our simple multimodal example, we can compute the score function analytically, allowing us to do exactly that. The following plot shows the resulting samples from the prior distribution, which match the ground truth distribution very closely.
+
+```{python}
+def reverse_step(x: Array, dt: float, beta_t: float, score: Array, key: Array) -> Array:
+    epsilon = random.normal(key, shape=x.shape)
+    drift = f(x, beta_t) - g(beta_t) ** 2 * score
+    return x - drift * dt + g(beta_t) * jnp.sqrt(dt) * epsilon
+
+
+def sample_reverse_process(
+    key: Array,
+    initial_samples: Array,
+    betas: Array,
+    dt: float,
+    score_function: Callable[[Array, int], Array],
+) -> tuple[Array, Array]:
+    num_steps = len(betas)
+    samples = initial_samples
+    trajectories = [samples]
+    for i in range(num_steps, 0, -1):
+        score = score_function(samples, i)
+        key, step_key = random.split(key)
+        samples = reverse_step(samples, dt, betas[i - 1], score, step_key)
+        trajectories.append(samples)
+    return key, jnp.stack(trajectories[::-1])
+```
 
 ```{python}
 def exact_prior_score(x_t: Array, i: int) -> Array:
@@ -506,7 +512,7 @@ $$
 \right].
 $$
 
-However, the score $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)$ is generally intractable. Instead, we rely on the score $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)$, which we know analytically from @eq-forward-conditional. We can prove that minimizing the *denoising score matching* objective
+As $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)$ is generally intractable, we isntead rely on the $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)$ which we know analytically from @eq-forward-conditional. Interestingly, one can prove that minimizing the *denoising score matching* objective
 
 $$
 \mathcal{L}(\boldsymbol{\theta})
@@ -519,16 +525,14 @@ $$
 \right]
 $$
 
-gives the same optimal solution as minimizing the original objective.
-
-Further, instead of learning the score function directly, it is common to train a network $\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\cdot,t)$ to predict the noise. For the Gaussian corruption kernel, we have
+gives the same optimal solution as minimizing the original objective.  Furthermore, instead of learning the score function directly, it is common to train a network $\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\cdot,t)$ to predict the noise. Although this only requires a reparameterization, it has been shown to improve the stability of training.  For the Gaussian corruption kernel, we have
 
 $$
 \begin{aligned}
 \nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)
-&=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}\boldsymbol{\epsilon},\\
+=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}\boldsymbol{\epsilon} \quad \Longrightarrow \quad
 \mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
-&=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}
+=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}
 \boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t),
 \end{aligned}
 $$
@@ -537,16 +541,14 @@ meaning that we can instead minimize the objective
 
 $$
 \mathcal{L}(\boldsymbol{\theta})
-=\frac{1}{2}\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\propto\frac{1}{2}\mathbb{E}_{t\sim\mathcal{U}[0,T]}
 \mathbb{E}_{\mathbf{x}_0}
 \mathbb{E}_{p_t(\mathbf{x}_t\mid\mathbf{x}_0)}
 \left[
-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}
 \left\|\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)-\boldsymbol{\epsilon}\right\|_2^2
 \right].
 $$
 
-Although this is only a reparameterization, it has been shown to improve the stability of training.
 
 In the following code, we learn the score function using a simple multilayer perceptron with two hidden layers. The neural network is implemented in JAX using the Flax library and trained using the Adam optimizer from Optax.
 
@@ -567,13 +569,6 @@ class MLP(nnx.Module):
         for layer in self.hidden_layers:
             hidden = nnx.silu(layer(hidden))
         return self.output_layer(hidden)[:, 0]
-
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    steps: int = 50_000
-    batch_size: int = 512
-    learning_rate: float = 3e-4
 
 
 def denoising_score_matching_loss(
@@ -610,16 +605,19 @@ def train_step(
 ```
 
 ```{python}
-training = TrainingConfig()
+steps: int = 50_000
+batch_size: int = 512
+learning_rate: float = 3e-4
+
 model = MLP((128, 128), rngs=nnx.Rngs(0))
-learning_rate = optax.cosine_decay_schedule(training.learning_rate, training.steps)
+learning_rate = optax.cosine_decay_schedule(learning_rate, steps)
 optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.Param)
 
 key = random.key(1)
 losses = []
-for _ in range(training.steps):
+for _ in range(steps):
     key, batch_key, loss_key = random.split(key, 3)
-    x_0 = sample_mixture(batch_key, prior_mixture, training.batch_size)
+    x_0 = sample_mixture(batch_key, prior_mixture, batch_size)
     losses.append(train_step(model, optimizer, x_0, integrated_betas, loss_key))
 losses = jnp.stack(losses)
 
@@ -669,6 +667,8 @@ plot_reverse_samples(
 )
 ```
 
+Again, we see that the learned prior distribution matches the ground truth very closely, indicating that the score function has been learned successfully. We can now utilize this learned prior to sample from the posterior distribution.
+
 ## Sampling from the posterior using training-free guidance
 
 Traditional guidance methods for diffusion models rely on training a separate conditional model to learn the posterior distribution. However, we want to use the learned generative model for the prior directly. Such a *training-free* approach means we avoid the need to retrain a model when we change the conditioning information.
@@ -711,21 +711,21 @@ $$
 \nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t).
 $$
 
-Assuming we have a possibly nonlinear observation operator
+Assuming we have a (possibly nonlinear) observation operator
 
 $$
 \mathbf{y}=\mathcal{A}(\mathbf{x}_0)+\boldsymbol{\eta},
 \qquad \boldsymbol{\eta}\sim\mathcal{N}(\mathbf{0},\sigma_e^2\mathbf{I}),
 $$
 
-the measurement alignment can therefore be approximated as
+the measurement alignment can be approximated as
 
 $$
 \begin{aligned}
 \nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)
-&\approx \nabla_{\mathbf{x}_t}\log
-\mathcal{N}(\mathbf{y};\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t)),\sigma_e^2\mathbf{I})\\
-&=-\frac{1}{2\sigma_e^2}\nabla_{\mathbf{x}_t}
+\approx \nabla_{\mathbf{x}_t}\log
+\mathcal{N}(\mathbf{y};\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t)),\sigma_e^2\mathbf{I})
+=-\frac{1}{2\sigma_e^2}\nabla_{\mathbf{x}_t}
 \left\|\mathbf{y}-\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t))\right\|_2^2.
 \end{aligned}
 $$
@@ -801,7 +801,7 @@ plot_reverse_samples(
 )
 ```
 
-There is a clear mismatch between the learned and true posterior distributions. The histogram appears to be slightly shifted to the right.  Due to our multimodal prior, the DPS approximation is likely not very accurate, leading to a biased posterior. This motivates the need for a more accurate training-free guidance method, which we discuss next.
+Although the learned prior was a good approximation of the true prior, we see that there is a clear mismatch between the learned and true posterior distributions.  The histogram appears to be slightly shifted to the right. This can likely be exampled by the fact that the DPS approximation is not very accurate for the multimodal prior. We therefore need a more accurate training-free guidance method, which guarantees convergence to the true posterior distribution.
 
 ### Twisted Diffusion Sampling
 
@@ -863,7 +863,7 @@ $$
 \qquad k=1,\ldots,K,
 $$
 
-where $\delta_{\mathbf{x}}$ denotes a point mass at $\mathbf{x}$. Thus, particles with large weights may be selected several times, while particles with small weights may disappear from the ensemble. The dotted notation $\dot{\mathbf{x}}_{i+1}^k$ denotes the resampled parent of particle $k$. Each resampled parent is then propagated using the twisted proposal,
+where $\delta_{\mathbf{x}}$ denotes a point mass at $\mathbf{x}$. Thus, particles with large weights may be selected several times, while particles with small weights may disappear from the ensemble. Each resampled parent is then propagated using the twisted proposal,
 
 $$
 \mathbf{x}_i^k\sim q_i(\cdot\mid\dot{\mathbf{x}}_{i+1}^k,\mathbf{y}).
@@ -882,9 +882,9 @@ q_i(\mathbf{x}_i^k\mid\dot{\mathbf{x}}_{i+1}^k,\mathbf{y})
 }.
 $$ {#eq-tds-weight}
 
-The procedure then repeats: normalize the new weights, resample the particles, propagate them one step, and compute the next set of weights, until $i=0$.
+The procedure then repeats by normalizing the new weights, resampling the particles, propagating them one step, and computing the next set of weights until we reach $i=0$.
 
-The role of the correction in @eq-tds-weight can be seen by multiplying the proposal densities and importance weights along a trajectory:
+The role of the correction in @eq-tds-weight can be seen by multiplying the proposal densities and importance weights along a trajectory
 
 $$
 \begin{aligned}
@@ -1042,4 +1042,6 @@ plot_reverse_samples(
 )
 ```
 
-Compared to DPS, TDS gives a much better approximation of the posterior distribution.
+Compared to DPS, TDS gives a much better approximation of the posterior distribution, and the critical statistician is likely happier with the result.
+
+Thank you for reading! If you have any questions or comments, feel free to reach out.
