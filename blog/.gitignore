@@ -1,0 +1,7 @@
+/.quarto/
+/.ruff_cache/
+/_freeze/
+**/.quarto_ipynb
+**/__pycache__/
+
+**/*.quarto_ipynb

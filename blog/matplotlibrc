@@ -1,0 +1,8 @@
+text.usetex : False
+font.family : monospace
+font.monospace : Lucida Console, DejaVu Sans Mono
+font.size : 12
+mathtext.fontset : custom
+mathtext.rm : DejaVu Sans Mono
+mathtext.it : DejaVu Sans Mono:italic
+mathtext.bf : DejaVu Sans Mono:bold

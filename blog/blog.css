@@ -1,0 +1,161 @@
+:root {
+    --text: #212529;
+    --muted: #666;
+    --faint: #888;
+    --link: #0066cc;
+    --link-hover: #003366;
+    --line: #e6e6e6;
+    --code-bg: #f7f7f7;
+}
+
+body {
+    color: var(--text);
+    font-family: 'Lucida Console', monospace;
+    font-size: 16px;
+    line-height: 1.55;
+}
+
+#quarto-content {
+    display: block;
+}
+
+main.content {
+    box-sizing: border-box;
+    max-width: 1000px;
+    margin-right: auto;
+    margin-left: auto;
+    padding-right: 20px;
+    padding-left: 20px;
+}
+
+main.content {
+    padding-top: 40px;
+    padding-bottom: 60px;
+}
+
+h1,
+h2,
+h3,
+h4 {
+    color: var(--text);
+    font-family: inherit;
+    font-weight: bold;
+    line-height: 1.25;
+}
+
+h1.title {
+    font-size: 2.25rem;
+}
+
+h2 {
+    margin-top: 2rem;
+    border-bottom: 0;
+    font-size: 1.55rem;
+}
+
+h3 {
+    font-size: 1.2rem;
+}
+
+p,
+ul,
+ol {
+    margin-bottom: 1rem;
+}
+
+a {
+    color: var(--link);
+    text-decoration: underline;
+}
+
+a:hover,
+a:focus {
+    color: var(--link-hover);
+}
+
+.quarto-title-meta,
+.quarto-title-meta-heading,
+.quarto-title-meta-contents,
+.quarto-title-meta-contents p {
+    color: var(--muted);
+    font-family: 'Lucida Console', monospace;
+    font-size: 1rem;
+    line-height: 1.55;
+}
+
+code {
+    color: var(--text);
+}
+
+div.sourceCode {
+    margin: 1.25rem 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--code-bg);
+}
+
+div.sourceCode pre.sourceCode {
+    margin: 0;
+    padding: 1rem;
+    overflow-x: auto;
+    border: 0;
+    background: transparent;
+}
+
+.cell-output pre {
+    margin: 0.5rem 0 1.25rem;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    border-left: 3px solid #d8d8d8;
+    background: #fafafa;
+}
+
+.cell-output pre code {
+    white-space: pre;
+}
+
+figure,
+.quarto-figure {
+    margin: 1.5rem auto;
+}
+
+figure img,
+.quarto-figure img,
+.cell-output-display img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin-right: auto;
+    margin-left: auto;
+}
+
+figcaption,
+.figure-caption {
+    color: var(--faint);
+    font-size: 0.85rem;
+    text-align: center;
+}
+
+.math.display {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.25rem 0;
+}
+
+@media (max-width: 600px) {
+    main.content {
+        padding-right: 15px;
+        padding-left: 15px;
+    }
+
+    h1.title {
+        font-size: 1.8rem;
+    }
+
+    div.sourceCode pre.sourceCode {
+        padding: 0.8rem;
+        font-size: 0.85rem;
+    }
+}

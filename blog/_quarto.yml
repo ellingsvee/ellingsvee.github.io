@@ -1,0 +1,18 @@
+project:
+  type: default
+  output-dir: _site
+  execute-dir: project
+  render:
+    - "posts/*/index.qmd"
+
+format:
+  html:
+    css: blog.css
+    include-in-header: _mathjax.html
+    html-math-method: mathjax
+    highlight-style: github
+    code-copy: false
+    toc: false
+
+execute:
+  freeze: false

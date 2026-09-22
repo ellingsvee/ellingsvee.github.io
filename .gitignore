@@ -1,1 +1,11 @@
-.DS_Store 
+.DS_Store
+**/.venv/
+
+# Quarto build products and execution caches
+_site/
+blog/_site/
+blog/.quarto/
+blog/_freeze/
+blog/**/.jupyter_cache/
+blog/**/.ipynb_checkpoints/
+blog/**/*.ipynb

@@ -1,0 +1,1045 @@
+---
+title: "Bayesian Sampling with Conditional Diffusion Models"
+author: "Elling Svee"
+date: 2026-09-22
+date-format: "MMMM D, YYYY"
+bibliography: ../refs.bib
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+In this post, we explore how to use generative diffusion models to perform Bayesian inference.
+
+```{python}
+import matplotlib.pyplot as plt
+
+plt.style.use("tableau-colorblind10")
+plt.rcParams.update(
+    {
+        "text.usetex": False,
+        "font.family": "monospace",
+        "font.monospace": ["Lucida Console", "DejaVu Sans Mono"],
+        "font.size": 12,
+        "mathtext.fontset": "custom",
+        "mathtext.rm": "DejaVu Sans Mono",
+        "mathtext.it": "DejaVu Sans Mono:italic",
+        "mathtext.bf": "DejaVu Sans Mono:bold",
+    }
+)
+
+THEME_COLORS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+PLOT_COLORS = {
+    "prior": "black",
+    "likelihood": THEME_COLORS[5],
+    "posterior": THEME_COLORS[0],
+    "samples": THEME_COLORS[6],
+    "loss": "black",
+}
+COLORBAR_PAD = 0.02
+```
+
+```{python}
+from dataclasses import dataclass
+from typing import Callable, NamedTuple
+
+import jax.numpy as jnp
+import jax.random as random
+import jax.scipy.stats as stats
+import optax
+from flax import nnx
+from jax import Array, grad, vmap
+from jax.nn import softmax
+```
+
+# Problem setup
+
+We consider a deliberately simple one-dimensional inverse problem in which all relevant distributions can be computed analytically. This gives us a ground truth against which we can compare the diffusion-based posterior samplers later in the post. The setup is adapted from the Gaussian-mixture example on page 24 of [these lecture notes](https://www.math.emory.edu/~lruthot/workshops/computational-math-ai-2025/slides/lecture09-slides-handout.pdf#page=24).
+
+The unknown state is a scalar $x\in\mathbb{R}$. We assign it a three-component Gaussian-mixture prior,
+
+$$
+p(x)=\sum_{k=1}^3 w_k\,\mathcal{N}(x;\mu_k,\sigma_k^2),
+$$
+
+with component weights, means, and standard deviations
+
+$$
+\mathbf{w}=(0.3,0.5,0.2),\qquad
+\boldsymbol{\mu}=(-2.5,0,1.5),\qquad
+\boldsymbol{\sigma}=(0.3,0.4,0.3).
+$$
+
+The separated modes make the prior simple enough to visualize while retaining the multimodality that makes posterior guidance challenging.
+
+We observe the state through the identity forward operator with additive Gaussian noise,
+
+$$
+y=\mathcal{A}(x)+\eta=x+\eta,\qquad
+\eta\sim\mathcal{N}(0,\sigma_y^2).
+$$
+
+Equivalently, the likelihood is $p(y\mid x)=\mathcal{N}(y;x,\sigma_y^2)$. We use the observation $y_{\mathrm{obs}}=0.5$ and noise standard deviation $\sigma_y=0.8$. Bayes' rule then gives
+
+$$
+p(x\mid y_{\mathrm{obs}})
+=\frac{p(y_{\mathrm{obs}}\mid x)p(x)}{p(y_{\mathrm{obs}})}.
+$$
+
+Because both the likelihood and each prior component are Gaussian, the posterior is also a three-component Gaussian mixture. For component $k$, Gaussian conditioning gives
+
+$$
+\widetilde{\sigma}_k^2
+=\left(\frac{1}{\sigma_k^2}+\frac{1}{\sigma_y^2}\right)^{-1}
+=\frac{\sigma_k^2\sigma_y^2}{\sigma_k^2+\sigma_y^2},
+\qquad
+\widetilde{\mu}_k
+=\widetilde{\sigma}_k^2
+\left(\frac{\mu_k}{\sigma_k^2}
++\frac{y_{\mathrm{obs}}}{\sigma_y^2}\right),
+$$
+
+while the component weights are updated according to their evidence,
+
+$$
+\widetilde{w}_k
+=\frac{
+w_k\,\mathcal{N}(y_{\mathrm{obs}};\mu_k,\sigma_k^2+\sigma_y^2)
+}{
+\sum_{j=1}^3 w_j\,\mathcal{N}(y_{\mathrm{obs}};\mu_j,\sigma_j^2+\sigma_y^2)
+}.
+$$
+
+For our chosen observation, the posterior weights are approximately $(0.0012,0.8011,0.1977)$. The likelihood therefore almost eliminates the leftmost prior mode at $x=-2.5$, while preserving substantial posterior mass around both remaining modes. This analytically available posterior will serve as the reference distribution in our experiments.
+
+```{python}
+class GaussianMixture(NamedTuple):
+    weights: Array
+    means: Array
+    stds: Array
+
+
+def mixture_density(x: Array, mixture: GaussianMixture) -> Array:
+    return jnp.sum(
+        mixture.weights * stats.norm.pdf(x[..., None], mixture.means, mixture.stds),
+        axis=-1,
+    )
+
+
+def mixture_score(x: Array, mixture: GaussianMixture) -> Array:
+    log_component_densities = jnp.log(mixture.weights) + stats.norm.logpdf(
+        x[..., None], mixture.means, mixture.stds
+    )
+    responsibilities = softmax(log_component_densities, axis=-1)
+    component_scores = -(x[..., None] - mixture.means) / mixture.stds**2
+    return jnp.sum(responsibilities * component_scores, axis=-1)
+
+
+def sample_mixture(key: Array, mixture: GaussianMixture, num_samples: int) -> Array:
+    component_key, noise_key = random.split(key)
+    components = random.categorical(
+        component_key, jnp.log(mixture.weights), shape=(num_samples,)
+    )
+    noise = random.normal(noise_key, shape=(num_samples,))
+    return mixture.means[components] + mixture.stds[components] * noise
+
+
+def likelihood_density(x: Array, observation: float, observation_std: float) -> Array:
+    return stats.norm.pdf(observation, x, observation_std)
+
+
+def condition_mixture(
+    prior: GaussianMixture, observation: float, observation_std: float
+) -> GaussianMixture:
+    posterior_variance = 1 / (1 / prior.stds**2 + 1 / observation_std**2)
+    posterior_means = posterior_variance * (
+        prior.means / prior.stds**2 + observation / observation_std**2
+    )
+    unnormalised_weights = prior.weights * stats.norm.pdf(
+        observation, prior.means, jnp.sqrt(prior.stds**2 + observation_std**2)
+    )
+    posterior_weights = unnormalised_weights / jnp.sum(unnormalised_weights)
+    return GaussianMixture(
+        posterior_weights,
+        posterior_means,
+        jnp.sqrt(posterior_variance),
+    )
+```
+
+```{python}
+grid = jnp.linspace(-4, 4, 1_000)
+prior_mixture = GaussianMixture(
+    weights=jnp.array([0.3, 0.5, 0.2]),
+    means=jnp.array([-2.5, 0.0, 1.5]),
+    stds=jnp.array([0.3, 0.4, 0.3]),
+)
+observation = 0.5
+observation_std = 0.8
+posterior_mixture = condition_mixture(prior_mixture, observation, observation_std)
+
+prior_density = mixture_density(grid, prior_mixture)
+likelihood = likelihood_density(grid, observation, observation_std)
+posterior_density = mixture_density(grid, posterior_mixture)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(grid, prior_density, label="Prior", color=PLOT_COLORS["prior"], linewidth=5)
+ax.plot(
+    grid,
+    likelihood,
+    label="Likelihood",
+    color=PLOT_COLORS["likelihood"],
+    linewidth=5,
+)
+ax.plot(
+    grid,
+    posterior_density,
+    label="Posterior",
+    color=PLOT_COLORS["posterior"],
+    linewidth=5,
+)
+ax.set(xlabel="State", ylabel="Density")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+# Prior sampling using a generative diffusion model
+
+
+A diffusion model is defined through a *continuous*-time stochastic process $\mathbf{x}(t)$ governed by a forward *stochastic differential equation* (SDE) on the interval $[0,T]$:
+
+$$
+\mathrm{d}\mathbf{x}(t)
+= \mathbf{f}(\mathbf{x}(t),t)\,\mathrm{d}t
++ g(t)\,\mathrm{d}\mathbf{w}(t),
+\qquad \mathbf{x}(0) \sim p_0.
+$$ {#eq-forward-sde}
+
+Here $\mathbf{f}(\cdot,t):\mathbb{R}^D\to\mathbb{R}^D$ is the *drift*, $g(t)\in\mathbb{R}$ is the scalar *diffusion coefficient*, and $\mathbf{w}(t)$ denotes a standard Wiener process. Without too much rigour, a *Wiener process* is a continuous-time stochastic process that starts at zero, has independent increments, and satisfies that for any $s<t$, the increment $\mathbf{w}(t)-\mathbf{w}(s)$ is normally distributed with mean zero and variance $t-s$.
+
+Once $\mathbf{f}$ and $g$ are specified, the forward process is fully determined, describing how the data variable is progressively corrupted through the injection of Gaussian noise. For this post, we focus on a *variance-preserving* SDE, where
+
+$$
+\mathbf{f}(\mathbf{x},t)=-\frac{1}{2}\beta(t)\mathbf{x},
+\qquad g(t)=\sqrt{\beta(t)},
+$$
+
+with a linear schedule $\beta(t)=\beta_{\min}+\frac{t}{T}(\beta_{\max}-\beta_{\min})$ for some $0<\beta_{\min}<\beta_{\max}$. Discretizing @eq-forward-sde with the Euler--Maruyama method for a small time step $\Delta t$ gives the update rule
+
+$$
+\mathbf{x}_{t+\Delta t}
+= \mathbf{x}_t-\frac{1}{2}\beta(t)\mathbf{x}_t\Delta t
++\sqrt{\beta(t)\Delta t}\,\boldsymbol{\epsilon}_t,
+\qquad \boldsymbol{\epsilon}_t\sim\mathcal{N}(0,I).
+$$
+
+Importantly, the forward process is *Markovian*, meaning that the distribution of $\mathbf{x}_{t+\Delta t}$ depends only on $\mathbf{x}_t$ and not on any previous states. We can also derive the distribution of $\mathbf{x}_t\mid\mathbf{x}_0$ as
+
+$$
+p_t(\mathbf{x}_t\mid\mathbf{x}_0)
+=\mathcal{N}\!\left(
+\mathbf{x}_t;
+\mathbf{x}_0 e^{-\frac{1}{2}\int_0^t\beta(\tau)\,\mathrm{d}\tau},
+\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}
+\right).
+$$ {#eq-forward-conditional}
+
+The following plot illustrates how the forward process transforms the prior distribution to a simple Gaussian distribution as $t$ approaches $T$. We plot the distribution over time as a heatmap, with some example trajectories of the forward process on top.
+
+```{python}
+def linear_beta_schedule(
+    num_steps: int, beta_start: float = 1e-4, beta_end: float = 0.02
+) -> Array:
+    return jnp.linspace(beta_start, beta_end, num_steps)
+
+
+def f(x: Array, beta_t: float) -> Array:
+    return -0.5 * beta_t * x
+
+
+def g(beta_t: float) -> Array:
+    return jnp.sqrt(beta_t)
+
+
+def forward_step(x: Array, dt: float, beta_t: float, key: Array) -> Array:
+    epsilon = random.normal(key, shape=x.shape)
+    return x + f(x, beta_t) * dt + g(beta_t) * jnp.sqrt(dt) * epsilon
+
+
+def reverse_step(x: Array, dt: float, beta_t: float, score: Array, key: Array) -> Array:
+    epsilon = random.normal(key, shape=x.shape)
+    drift = f(x, beta_t) - g(beta_t) ** 2 * score
+    return x - drift * dt + g(beta_t) * jnp.sqrt(dt) * epsilon
+
+
+def diffuse_mixture(
+    mixture: GaussianMixture, integrated_beta: Array
+) -> GaussianMixture:
+    exp_integrated_beta = jnp.exp(-integrated_beta)
+    return GaussianMixture(
+        mixture.weights,
+        jnp.sqrt(exp_integrated_beta) * mixture.means,
+        jnp.sqrt(exp_integrated_beta * mixture.stds**2 + (1 - exp_integrated_beta)),
+    )
+
+
+def sample_forward_process(
+    key: Array,
+    initial_samples: Array,
+    betas: Array,
+    dt: float,
+) -> tuple[Array, Array]:
+    samples = initial_samples
+    trajectories = [samples]
+    for beta_t in betas:
+        key, step_key = random.split(key)
+        samples = forward_step(samples, dt, beta_t, step_key)
+        trajectories.append(samples)
+    return key, jnp.stack(trajectories)
+
+
+def sample_reverse_process(
+    key: Array,
+    initial_samples: Array,
+    betas: Array,
+    dt: float,
+    score_function: Callable[[Array, int], Array],
+) -> tuple[Array, Array]:
+    num_steps = len(betas)
+    samples = initial_samples
+    trajectories = [samples]
+    for i in range(num_steps, 0, -1):
+        score = score_function(samples, i)
+        key, step_key = random.split(key)
+        samples = reverse_step(samples, dt, betas[i - 1], score, step_key)
+        trajectories.append(samples)
+    return key, jnp.stack(trajectories[::-1])
+```
+
+```{python}
+num_steps = 1000
+num_samples = 30_000
+dt = 1.0
+betas = linear_beta_schedule(num_steps)
+integrated_betas = jnp.concatenate((jnp.zeros(1), jnp.cumsum(betas * dt)))
+
+key = random.key(0)
+key, sample_key = random.split(key)
+initial_samples = sample_mixture(sample_key, prior_mixture, num_samples)
+key, forward_trajectories = sample_forward_process(key, initial_samples, betas, dt)
+
+diffused_prior_mixtures = vmap(diffuse_mixture, in_axes=(None, 0))(
+    prior_mixture, integrated_betas
+)
+prior_density_by_time = vmap(mixture_density, in_axes=(None, 0))(
+    grid, diffused_prior_mixtures
+)
+```
+
+```{python}
+def plot_trajectories(
+    trajectories: Array,
+    density_by_time: Array,
+    title: str,
+) -> None:
+    num_steps, num_samples = trajectories.shape[0] - 1, trajectories.shape[1]
+    trajectory_indices = jnp.linspace(0, num_samples - 1, 30, dtype=jnp.int32)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    image = ax.imshow(
+        density_by_time.T,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        extent=(0, num_steps, float(grid[0]), float(grid[-1])),
+    )
+    ax.grid(False)
+    ax.plot(
+        jnp.arange(num_steps + 1),
+        trajectories[:, trajectory_indices],
+        color="white",
+        alpha=0.25,
+        linewidth=0.7,
+    )
+    fig.colorbar(image, ax=ax, pad=COLORBAR_PAD, label="Density")
+    ax.set(xlabel="Diffusion step", ylabel="State", title=title)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_reverse_samples(
+    trajectories: Array,
+    density_by_time: Array,
+    target_density: Array,
+    trajectory_title: str,
+    histogram_title: str,
+    target_label: str,
+    sample_weights: Array | None = None,
+) -> None:
+    num_steps, num_samples = trajectories.shape[0] - 1, trajectories.shape[1]
+    trajectory_indices = jnp.linspace(0, num_samples - 1, 30, dtype=jnp.int32)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    image = axes[0].imshow(
+        density_by_time.T,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        extent=(0, num_steps, float(grid[0]), float(grid[-1])),
+    )
+    axes[0].grid(False)
+    axes[0].plot(
+        jnp.arange(num_steps + 1),
+        trajectories[:, trajectory_indices],
+        color="white",
+        alpha=0.25,
+        linewidth=0.7,
+    )
+    fig.colorbar(image, ax=axes[0], pad=COLORBAR_PAD, label="Density")
+    axes[0].set(
+        xlabel="Diffusion step",
+        ylabel="State",
+        title=trajectory_title,
+    )
+    axes[1].hist(
+        trajectories[0],
+        bins=60,
+        range=(float(grid[0]), float(grid[-1])),
+        density=True,
+        weights=sample_weights,
+        color=PLOT_COLORS["samples"],
+        edgecolor="white",
+        label="Samples",
+    )
+    axes[1].plot(
+        grid,
+        target_density,
+        color=PLOT_COLORS[target_label.lower()],
+        linewidth=3,
+        label=target_label,
+    )
+    axes[1].set(xlabel="State", ylabel="Density", title=histogram_title)
+    axes[1].legend()
+    fig.tight_layout()
+    plt.show()
+
+
+plot_trajectories(
+    forward_trajectories,
+    prior_density_by_time,
+    "Forward process",
+)
+```
+
+Intuitively, we can imagine that if we could run the forward process backwards, we would be able to start from pure noise and recover samples from the prior distribution. The remarkable insight of score-based diffusion models is that, although we cannot reverse individual stochastic trajectories, the distribution over those trajectories is reversible. @anderson_reverse_time_1982 formalizes this by constructing a time-reversed process $\widetilde{\mathbf{x}}(t)$ defined by the SDE
+
+$$
+\begin{aligned}
+\mathrm{d}\widetilde{\mathbf{x}}(t)
+&=\left[\mathbf{f}(\widetilde{\mathbf{x}}(t),t)
+-g^2(t)\nabla_{\mathbf{x}}\log p_t(\widetilde{\mathbf{x}}(t))\right]\mathrm{d}t
++g(t)\,\mathrm{d}\widetilde{\mathbf{w}}(t),\\
+\widetilde{\mathbf{x}}(T)&\sim p_{\text{prior}}\approx p_T.
+\end{aligned}
+$$ {#eq-reverse-sde}
+
+Here $\widetilde{\mathbf{w}}(t)$ denotes a standard Wiener process in reverse time, defined as $\widetilde{\mathbf{w}}(t)=\mathbf{w}(T-t)-\mathbf{w}(T)$. The key term to notice is $\nabla_{\mathbf{x}}\log p_t$, pulling the process towards regions of high probability. For a Gaussian distribution $\mathbf{x}\sim\mathcal{N}(\boldsymbol{\mu},\boldsymbol{\Sigma})$, the score function is given by
+
+$$
+\nabla_{\mathbf{x}}\log p(\mathbf{x})
+=-\boldsymbol{\Sigma}^{-1}(\mathbf{x}-\boldsymbol{\mu}).
+$$
+
+Those familiar with MCMC might also notice the similarity to Langevin dynamics [@dunson_hastings_2020]. Discretizing @eq-reverse-sde in a similar manner as for the forward process yields the stochastic updates
+
+$$
+\begin{aligned}
+\widetilde{\mathbf{x}}_{t-\Delta t}
+={}&\widetilde{\mathbf{x}}_t
+-\left[-\frac{1}{2}\beta(t)\widetilde{\mathbf{x}}_t
+-\beta(t)\nabla_{\widetilde{\mathbf{x}}_t}\log p_t(\widetilde{\mathbf{x}}_t)\right]\Delta t\\
+&-\sqrt{\beta(t)\Delta t}\,\widetilde{\boldsymbol{\epsilon}}_t,
+\qquad \widetilde{\boldsymbol{\epsilon}}_t\sim\mathcal{N}(0,\mathbf{I}).
+\end{aligned}
+$$ {#eq-reverse-discrete}
+
+Observe that if we knew the score function $\nabla_{\mathbf{x}}\log p_t$ for all $t$, we could sample from $p_0$ by starting from $p_T\approx p_{\text{noise}}\sim\mathcal{N}(\mathbf{0},\mathbf{I})$ and iteratively applying the updates above. For our simple multimodal example, we can compute the score function analytically.
+
+```{python}
+def exact_prior_score(x_t: Array, i: int) -> Array:
+    mixture_t = GaussianMixture(
+        diffused_prior_mixtures.weights[i],
+        diffused_prior_mixtures.means[i],
+        diffused_prior_mixtures.stds[i],
+    )
+    return mixture_score(x_t, mixture_t)
+
+
+key, initial_key = random.split(key)
+initial_samples = random.normal(initial_key, shape=(num_samples,))
+key, exact_prior_trajectories = sample_reverse_process(
+    key,
+    initial_samples,
+    betas,
+    dt,
+    exact_prior_score,
+)
+
+plot_reverse_samples(
+    exact_prior_trajectories,
+    prior_density_by_time,
+    prior_density,
+    "Reverse process (exact score)",
+    "Exact-score samples vs. true prior",
+    "Prior",
+)
+```
+
+However, in practice we do not have access to the score function and must instead learn it from data. This is done by training a neural-network approximation $\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x},t)\approx\nabla_{\mathbf{x}}\log p_t(\mathbf{x})$ to minimize the objective
+
+$$
+\mathcal{L}(\boldsymbol{\theta})
+=\frac{1}{2}\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_t\sim p_t}
+\left[
+\left\|\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+-\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)\right\|_2^2
+\right].
+$$
+
+However, the score $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)$ is generally intractable. Instead, we rely on the score $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)$, which we know analytically from @eq-forward-conditional. We can prove that minimizing the *denoising score matching* objective
+
+$$
+\mathcal{L}(\boldsymbol{\theta})
+=\frac{1}{2}\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_0}
+\mathbb{E}_{p_t(\mathbf{x}_t\mid\mathbf{x}_0)}
+\left[
+\left\|\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+-\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)\right\|_2^2
+\right]
+$$
+
+gives the same optimal solution as minimizing the original objective.
+
+Further, instead of learning the score function directly, it is common to train a network $\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\cdot,t)$ to predict the noise. For the Gaussian corruption kernel, we have
+
+$$
+\begin{aligned}
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)
+&=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}\boldsymbol{\epsilon},\\
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+&=-\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}
+\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t),
+\end{aligned}
+$$
+
+meaning that we can instead minimize the objective
+
+$$
+\mathcal{L}(\boldsymbol{\theta})
+=\frac{1}{2}\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_0}
+\mathbb{E}_{p_t(\mathbf{x}_t\mid\mathbf{x}_0)}
+\left[
+\left(\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)^{-1/2}
+\left\|\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)-\boldsymbol{\epsilon}\right\|_2^2
+\right].
+$$
+
+Although this is only a reparameterization, it has been shown to improve the stability of training.
+
+In the following code, we learn the score function using a simple multilayer perceptron with two hidden layers. The neural network is implemented in JAX using the Flax library and trained using the Adam optimizer from Optax.
+
+```{python}
+class MLP(nnx.Module):
+    def __init__(self, hidden_sizes: tuple[int, ...], *, rngs: nnx.Rngs):
+        sizes = (2,) + hidden_sizes
+        self.hidden_layers = nnx.List(
+            [
+                nnx.Linear(input_size, output_size, rngs=rngs)
+                for input_size, output_size in zip(sizes[:-1], sizes[1:], strict=True)
+            ]
+        )
+        self.output_layer = nnx.Linear(hidden_sizes[-1], 1, rngs=rngs)
+
+    def __call__(self, values: Array, times: Array) -> Array:
+        hidden = jnp.stack((values, times), axis=-1)
+        for layer in self.hidden_layers:
+            hidden = nnx.silu(layer(hidden))
+        return self.output_layer(hidden)[:, 0]
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    steps: int = 50_000
+    batch_size: int = 512
+    learning_rate: float = 3e-4
+
+
+def denoising_score_matching_loss(
+    model: MLP,
+    x_0: Array,
+    integrated_betas: Array,
+    key: Array,
+) -> Array:
+    step_key, noise_key = random.split(key)
+    num_steps = len(integrated_betas) - 1
+    steps = random.randint(step_key, x_0.shape, 1, num_steps + 1)
+    exp_integrated_beta = jnp.exp(-integrated_betas[steps])
+    mean = jnp.sqrt(exp_integrated_beta) * x_0
+    variance = 1 - exp_integrated_beta
+    epsilon = random.normal(noise_key, x_0.shape)
+    x_t = mean + jnp.sqrt(variance) * epsilon
+    predicted_epsilon = model(x_t, steps / num_steps)
+    return jnp.mean((predicted_epsilon - epsilon) ** 2)
+
+
+@nnx.jit
+def train_step(
+    model: MLP,
+    optimizer: nnx.Optimizer,
+    x_0: Array,
+    integrated_betas: Array,
+    key: Array,
+) -> Array:
+    loss, gradients = nnx.value_and_grad(denoising_score_matching_loss)(
+        model, x_0, integrated_betas, key
+    )
+    optimizer.update(model, gradients)
+    return loss
+```
+
+```{python}
+training = TrainingConfig()
+model = MLP((128, 128), rngs=nnx.Rngs(0))
+learning_rate = optax.cosine_decay_schedule(training.learning_rate, training.steps)
+optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.Param)
+
+key = random.key(1)
+losses = []
+for _ in range(training.steps):
+    key, batch_key, loss_key = random.split(key, 3)
+    x_0 = sample_mixture(batch_key, prior_mixture, training.batch_size)
+    losses.append(train_step(model, optimizer, x_0, integrated_betas, loss_key))
+losses = jnp.stack(losses)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(losses, color=PLOT_COLORS["loss"])
+ax.set(xlabel="Step", ylabel="Loss", yscale="log")
+fig.tight_layout()
+plt.show()
+```
+
+Having learned the score function, we can now sample from the prior distribution using @eq-reverse-sde. The following illustrates the reverse process and compares the learned and true prior distributions.
+
+```{python}
+def learned_score(
+    model: MLP,
+    x_t: Array,
+    i: int,
+    integrated_betas: Array,
+) -> Array:
+    variance = 1 - jnp.exp(-integrated_betas[i])
+    time = jnp.full(x_t.shape, i / (len(integrated_betas) - 1))
+    predicted_epsilon = model(x_t, time)
+    return -predicted_epsilon / jnp.sqrt(variance)
+
+
+def learned_prior_score(x_t: Array, i: int) -> Array:
+    return learned_score(model, x_t, i, integrated_betas)
+
+
+key, initial_key = random.split(key)
+initial_samples = random.normal(initial_key, shape=(num_samples,))
+key, learned_prior_trajectories = sample_reverse_process(
+    key,
+    initial_samples,
+    betas,
+    dt,
+    learned_prior_score,
+)
+
+plot_reverse_samples(
+    learned_prior_trajectories,
+    prior_density_by_time,
+    prior_density,
+    "Reverse process (learned score)",
+    "Samples vs. true prior",
+    "Prior",
+)
+```
+
+## Sampling from the posterior using training-free guidance
+
+Traditional guidance methods for diffusion models rely on training a separate conditional model to learn the posterior distribution. However, we want to use the learned generative model for the prior directly. Such a *training-free* approach means we avoid the need to retrain a model when we change the conditioning information.
+
+To understand how we can use the learned prior model to sample from the posterior, we can decompose the posterior score using Bayes' rule:
+
+$$
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}\mid\mathbf{y})
+=\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x})}_{\text{Prior score}}
++\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)}_{\text{Measurement alignment}}.
+$$ {#eq-posterior-score}
+
+The prior score is what we have already approximated using $\mathbf{s}_{\boldsymbol{\theta}}(\cdot,t)$, but the measurement alignment is intractable because it requires marginalizing over the latent variables. As a result, training-free approaches rely on approximating $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)$. Having approximated the posterior score, we can then use it in the reverse SDE to guide the reverse diffusion process towards the posterior distribution.
+
+### Diffusion Posterior Sampling
+
+The most common training-free guidance is *Diffusion Posterior Sampling* (DPS) [@chung_diffusion_2024]. It approximates the measurement alignment by assuming the conditional distribution $p(\mathbf{x}_0\mid\mathbf{x}_t)$ is sharply concentrated around its mean. In this case,
+
+$$
+\begin{aligned}
+p_t(\mathbf{y}\mid\mathbf{x}_t)
+&=\int p_t(\mathbf{y}\mid\mathbf{x}_t,\mathbf{x}_0)
+p(\mathbf{x}_0\mid\mathbf{x}_t)\,\mathrm{d}\mathbf{x}_0\\
+&=\int p_t(\mathbf{y}\mid\mathbf{x}_0)
+p(\mathbf{x}_0\mid\mathbf{x}_t)\,\mathrm{d}\mathbf{x}_0
+\approx p_t(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_t)),
+\end{aligned}
+$$
+
+with $\widehat{\mathbf{x}}_0(\mathbf{x}_t)=\mathbb{E}[\mathbf{x}_0\mid\mathbf{x}_t]$, giving
+$\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)
+\approx\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_t))$.
+The $\widehat{\mathbf{x}}_0$ term is computable using Tweedie's formula, where
+
+$$
+\widehat{\mathbf{x}}_0(\mathbf{x}_t)
+=\mathbb{E}[\mathbf{x}_0\mid\mathbf{x}_t]
+=\mathbf{x}_t+
+\left(1-e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t).
+$$
+
+Assuming we have a possibly nonlinear observation operator
+
+$$
+\mathbf{y}=\mathcal{A}(\mathbf{x}_0)+\boldsymbol{\eta},
+\qquad \boldsymbol{\eta}\sim\mathcal{N}(\mathbf{0},\sigma_e^2\mathbf{I}),
+$$
+
+the measurement alignment can therefore be approximated as
+
+$$
+\begin{aligned}
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)
+&\approx \nabla_{\mathbf{x}_t}\log
+\mathcal{N}(\mathbf{y};\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t)),\sigma_e^2\mathbf{I})\\
+&=-\frac{1}{2\sigma_e^2}\nabla_{\mathbf{x}_t}
+\left\|\mathbf{y}-\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t))\right\|_2^2.
+\end{aligned}
+$$
+
+Substituting this into @eq-posterior-score gives an approximation of the posterior score. Using this score in @eq-reverse-discrete gives a single reverse diffusion trajectory that moves towards the posterior distribution. The following code performs this guided sampling and compares the learned and true posterior distributions.
+
+```{python}
+def tweedie_mean(
+    x_t: Array,
+    i: int,
+    integrated_betas: Array,
+    score_function: Callable[[Array, int], Array],
+) -> Array:
+    exp_integrated_beta = jnp.exp(-integrated_betas[i])
+    variance = 1 - exp_integrated_beta
+    score = score_function(x_t, i)
+    return (x_t + variance * score) / jnp.sqrt(exp_integrated_beta)
+
+
+def measurement_alignment(
+    x_t: Array,
+    i: int,
+    integrated_betas: Array,
+    score_function: Callable[[Array, int], Array],
+    observation: float,
+    observation_std: float,
+) -> Array:
+    def approximate_log_likelihood(values: Array) -> Array:
+        x_0_hat = tweedie_mean(values, i, integrated_betas, score_function)
+        squared_residual = (observation - x_0_hat) ** 2
+        return -jnp.sum(squared_residual) / (2 * observation_std**2)
+
+    return grad(approximate_log_likelihood)(x_t)
+
+
+def dps_posterior_score(x_t: Array, i: int) -> Array:
+    score = exact_prior_score(x_t, i)
+    alignment = measurement_alignment(
+        x_t,
+        i,
+        integrated_betas,
+        exact_prior_score,
+        observation,
+        observation_std,
+    )
+    return score + alignment
+
+
+key, initial_key = random.split(key)
+initial_samples = random.normal(initial_key, shape=(num_samples,))
+key, dps_trajectories = sample_reverse_process(
+    key,
+    initial_samples,
+    betas,
+    dt,
+    dps_posterior_score,
+)
+
+diffused_posterior_mixtures = vmap(diffuse_mixture, in_axes=(None, 0))(
+    posterior_mixture, integrated_betas
+)
+posterior_density_by_time = vmap(mixture_density, in_axes=(None, 0))(
+    grid, diffused_posterior_mixtures
+)
+
+plot_reverse_samples(
+    dps_trajectories,
+    posterior_density_by_time,
+    posterior_density,
+    "Reverse process (DPS, exact prior score)",
+    "DPS samples vs. true posterior",
+    "Posterior",
+)
+```
+
+There is a clear mismatch between the learned and true posterior distributions. The histogram appears to be slightly shifted to the right.  Due to our multimodal prior, the DPS approximation is likely not very accurate, leading to a biased posterior. This motivates the need for a more accurate training-free guidance method, which we discuss next.
+
+### Twisted Diffusion Sampling
+
+*Twisted Diffusion Sampling* (TDS) [@wu_practical_2024] combines diffusion guidance with *Sequential Monte Carlo* (SMC). As in DPS, it uses a tractable approximation of the measurement likelihood to guide the reverse diffusion process. The difference is that TDS treats this guidance only as a proposal and corrects it using importance weights.
+
+To describe the method, discretize the diffusion interval as $0=t_0<\cdots<t_N=T$, and write $\mathbf{x}_i=\mathbf{x}(t_i)$. The Markovian structure of the learned reverse process gives
+
+$$
+p_{\boldsymbol{\theta}}(\mathbf{x}_{0:N}\mid\mathbf{y})
+=\frac{1}{p(\mathbf{y})}p(\mathbf{x}_N)
+\prod_{i=0}^{N-1}p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})
+p(\mathbf{y}\mid\mathbf{x}_0).
+$$ {#eq-tds-target}
+
+The posterior $p(\mathbf{x}_0\mid\mathbf{y})$ is the marginal of this distribution at $t_0=0$. In SMC, we represent the distribution at each diffusion step by a weighted particle ensemble $\{(\mathbf{x}_i^k,w_i^k)\}_{k=1}^K$, where $\mathbf{x}_i^k$ is a state and $w_i^k$ is its associated importance weight at time $t_i$. Through a clever choice of the twisting function, we can ensure that the ensemble at time $0$ approximates the true posterior $p(\mathbf{x}_0\mid\mathbf{y})$.
+
+A naive SMC sampler would propagate the particles using the full unconditional reverse process and only set the weights as $w_0^k=p(\mathbf{y}\mid\mathbf{x}_0^k)$ at the final step. However, since most particles may reach $t=0$ in regions where $p(\mathbf{y}\mid\mathbf{x}_0)$ is negligible, this gives a small effective sample size and a poor approximation. TDS avoids this by introducing a *twisting function*
+
+$$
+\begin{aligned}
+\psi_i(\mathbf{x}_i)
+&:=p(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_i))\\
+&\approx p(\mathbf{y}\mid\mathbf{x}_i)
+=\int p(\mathbf{y}\mid\mathbf{x}_0)
+p(\mathbf{x}_0\mid\mathbf{x}_i)\,\mathrm{d}\mathbf{x}_0,
+\end{aligned}
+$$ {#eq-tds-exact-twist}
+
+which approximates the likelihood of the observation at intermediate diffusion times. In the same way as DPS, the intractable likelihood $p(\mathbf{y}\mid\mathbf{x}_i)$ is approximated using Tweedie's formula. At the final step no approximation is required, so we set $\psi_0(\mathbf{x}_0)=p(\mathbf{y}\mid\mathbf{x}_0)$.
+
+Replacing the measurement-alignment term in @eq-posterior-score with the gradient of the twisting function, we obtain the approximate conditional score
+
+$$
+\widetilde{\mathbf{s}}(\mathbf{x}_i,t_i)
+=\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_i,t_i)
++\nabla_{\mathbf{x}_i}\log\psi_i(\mathbf{x}_i).
+$$ {#eq-tds-score}
+
+Substituting this into the discretized reverse SDE from @eq-reverse-discrete gives a proposal $q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})$ which pushes particles towards states that are both likely under the learned prior and compatible with the observations. The crucial difference from DPS is that TDS corrects for sampling from $q_i$ rather than from the original reverse transition. By initializing
+
+$$
+\mathbf{x}_N^k\overset{\mathrm{iid}}{\sim}p_T,
+\qquad w_N^k=\psi_N(\mathbf{x}_N^k),
+\qquad k=1,\ldots,K,
+$$
+
+the ensemble is corrected at a generic step from $t_{i+1}$ to $t_i$ by first computing the normalized weights
+
+$$
+\dot{w}_{i+1}^k
+=\frac{w_{i+1}^k}{\sum_{j=1}^K w_{i+1}^j}.
+$$
+
+We then *resample* $K$ parent particles according to these weights,
+
+$$
+\dot{\mathbf{x}}_{i+1}^k
+\sim\sum_{j=1}^K\dot{w}_{i+1}^j\delta_{\mathbf{x}_{i+1}^j},
+\qquad k=1,\ldots,K,
+$$
+
+where $\delta_{\mathbf{x}}$ denotes a point mass at $\mathbf{x}$. Thus, particles with large weights may be selected several times, while particles with small weights may disappear from the ensemble. The dotted notation $\dot{\mathbf{x}}_{i+1}^k$ denotes the resampled parent of particle $k$. Each resampled parent is then propagated using the twisted proposal,
+
+$$
+\mathbf{x}_i^k\sim q_i(\cdot\mid\dot{\mathbf{x}}_{i+1}^k,\mathbf{y}).
+$$
+
+Since this proposal differs from the original reverse transition, the propagated particle receives the incremental importance weight
+
+$$
+w_i^k
+=\frac{
+p_{\boldsymbol{\theta}}(\mathbf{x}_i^k\mid\dot{\mathbf{x}}_{i+1}^k)
+\psi_i(\mathbf{x}_i^k)
+}{
+q_i(\mathbf{x}_i^k\mid\dot{\mathbf{x}}_{i+1}^k,\mathbf{y})
+\psi_{i+1}(\dot{\mathbf{x}}_{i+1}^k)
+}.
+$$ {#eq-tds-weight}
+
+The procedure then repeats: normalize the new weights, resample the particles, propagate them one step, and compute the next set of weights, until $i=0$.
+
+The role of the correction in @eq-tds-weight can be seen by multiplying the proposal densities and importance weights along a trajectory:
+
+$$
+\begin{aligned}
+&p(\mathbf{x}_N)\psi_N(\mathbf{x}_N)
+\prod_{i=0}^{N-1}
+\left[
+p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})
+\frac{
+q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})\psi_i(\mathbf{x}_i)
+}{
+q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})\psi_{i+1}(\mathbf{x}_{i+1})
+}
+\right]\\
+&\qquad =p(\mathbf{x}_N)
+\prod_{i=0}^{N-1}p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})
+p(\mathbf{y}\mid\mathbf{x}_0).
+\end{aligned}
+$$
+
+The proposal densities cancel, as do the intermediate twisting functions. What remains is exactly the unnormalized target in @eq-tds-target. Consequently, the intermediate $\psi_i$ only affect how efficiently particles are proposed; they do not change the SMC target. Under the conditions given by @wu_practical_2024, the particle approximation converges to the posterior of the discretized diffusion model as $K\to\infty$.
+
+Implementing the TDS algorithm, we replace the DPS guidance term with the gradient of the twisting function and compute the importance weights according to @eq-tds-weight. The following code illustrates this procedure and compares the learned and true posterior distributions.
+
+```{python}
+def log_twisting_function(
+    x_t: Array,
+    i: int,
+    integrated_betas: Array,
+    score_function: Callable[[Array, int], Array],
+    observation: float,
+    observation_std: float,
+) -> Array:
+    if i == 0:
+        x_0_hat = x_t
+    else:
+        x_0_hat = tweedie_mean(x_t, i, integrated_betas, score_function)
+    return stats.norm.logpdf(observation, x_0_hat, observation_std)
+
+
+def systematic_resample(key: Array, normalized_weights: Array) -> Array:
+    num_particles = len(normalized_weights)
+    offset = random.uniform(key) / num_particles
+    positions = offset + jnp.arange(num_particles) / num_particles
+    return jnp.searchsorted(jnp.cumsum(normalized_weights), positions)
+
+
+def sample_tds(
+    key: Array,
+    initial_particles: Array,
+    betas: Array,
+    dt: float,
+    integrated_betas: Array,
+    score_function: Callable[[Array, int], Array],
+    observation: float,
+    observation_std: float,
+) -> tuple[Array, Array, Array]:
+    num_steps = len(betas)
+    num_particles = len(initial_particles)
+    particles = initial_particles
+    particle_history = [particles]
+    ancestor_history = []
+
+    log_weights = log_twisting_function(
+        particles,
+        num_steps,
+        integrated_betas,
+        score_function,
+        observation,
+        observation_std,
+    )
+
+    for i in range(num_steps, 0, -1):
+        key, resampling_key, proposal_key = random.split(key, 3)
+        ancestor_indices = systematic_resample(resampling_key, softmax(log_weights))
+        x_t = particles[ancestor_indices]
+
+        prior_score = score_function(x_t, i)
+        alignment = measurement_alignment(
+            x_t,
+            i,
+            integrated_betas,
+            score_function,
+            observation,
+            observation_std,
+        )
+        twisted_score = prior_score + alignment
+
+        beta_t = betas[i - 1]
+        transition_std = g(beta_t) * jnp.sqrt(dt)
+        prior_mean = x_t - (f(x_t, beta_t) - g(beta_t) ** 2 * prior_score) * dt
+        proposal_mean = x_t - (f(x_t, beta_t) - g(beta_t) ** 2 * twisted_score) * dt
+        particles = proposal_mean + transition_std * random.normal(
+            proposal_key, shape=x_t.shape
+        )
+
+        log_twist_t = log_twisting_function(
+            x_t,
+            i,
+            integrated_betas,
+            score_function,
+            observation,
+            observation_std,
+        )
+        log_twist_previous = log_twisting_function(
+            particles,
+            i - 1,
+            integrated_betas,
+            score_function,
+            observation,
+            observation_std,
+        )
+        log_weights = (
+            stats.norm.logpdf(particles, prior_mean, transition_std)
+            + log_twist_previous
+            - stats.norm.logpdf(particles, proposal_mean, transition_std)
+            - log_twist_t
+        )
+
+        particle_history.append(particles)
+        ancestor_history.append(ancestor_indices)
+
+    # Follow the resampling indices backwards so plotted lines are particle paths,
+    # rather than connections between unrelated particles in adjacent populations.
+    lineage_indices = jnp.arange(num_particles)
+    trajectories = [particle_history[-1]]
+    for i in range(num_steps - 1, -1, -1):
+        lineage_indices = ancestor_history[i][lineage_indices]
+        trajectories.append(particle_history[i][lineage_indices])
+
+    normalized_weights = softmax(log_weights)
+    return key, jnp.stack(trajectories), normalized_weights
+
+
+key, initial_key = random.split(key)
+initial_particles = random.normal(initial_key, shape=(num_samples,))
+key, tds_trajectories, tds_weights = sample_tds(
+    key,
+    initial_particles,
+    betas,
+    dt,
+    integrated_betas,
+    exact_prior_score,
+    observation,
+    observation_std,
+)
+
+plot_reverse_samples(
+    tds_trajectories,
+    posterior_density_by_time,
+    posterior_density,
+    "Reverse process (TDS, exact prior score)",
+    "TDS samples vs. true posterior",
+    "Posterior",
+    sample_weights=tds_weights,
+)
+```
+
+Compared to DPS, TDS gives a much better approximation of the posterior distribution.
