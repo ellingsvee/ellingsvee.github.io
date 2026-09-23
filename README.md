@@ -14,13 +14,13 @@ uv sync --project blog
 
 Add future Python dependencies with `uv add --project blog <package>` so both `pyproject.toml` and `uv.lock` stay current.
 
-### Regenerating the diffusion post
+### Regenerating posts from notebooks
 
 After editing `blog/posts/conditional_diffusion_sampling.ipynb`, regenerate the tracked Quarto source from the repository root:
 
 ```sh
 quarto convert blog/posts/conditional_diffusion_sampling.ipynb \
-  --output blog/posts/bayesian-sampling-conditional-diffusion/index.qmd
+  --output sampling-with-conditional-diffusion-models/index.qmd
 ```
 
 The notebook front matter contains the publication metadata and output-relative bibliography path, so no metadata edits should be needed after conversion. If the post title changes, update its link text in `index.html` as well. Then render the complete site to verify the post:
@@ -32,7 +32,7 @@ uv run --project blog --locked quarto render blog
 From the repository root, preview the diffusion post with live reload:
 
 ```sh
-uv run --project blog -- quarto preview blog/posts/bayesian-sampling-conditional-diffusion/index.qmd
+uv run --project blog -- quarto preview blog/posts/sampling-with-conditional-diffusion-models/index.qmd
 ```
 
 Render the production blog to `blog/_site`:

@@ -682,7 +682,7 @@ def denoising_score_matching_loss(
     epsilon = random.normal(noise_key, x_0.shape)
     x_t = mean + jnp.sqrt(variance) * epsilon
     predicted_epsilon = model(x_t, steps / num_steps)
-    return jnp.mean((predicted_epsilon - epsilon) ** 2)
+    return jnp.mean((1 / variance) * jnp.linalg.norm(predicted_epsilon - epsilon) ** 2)
 
 
 @nnx.jit
@@ -701,7 +701,7 @@ def train_step(
 ```
 
 ```{python}
-steps: int = 50_000
+steps: int = 30_000
 batch_size: int = 512
 learning_rate: float = 3e-4
 
@@ -780,16 +780,7 @@ $$
 $$ {#eq-posterior-score}
 
 The prior score is what we have already approximated using
-$\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)$, or equivalently through the noise-prediction parameterization
-
-$$
-\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
-=
--\frac{1}{\sigma_t}
-\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t).
-$$
-
-The measurement-alignment term is generally intractable because it requires marginalizing over the unknown clean sample $\mathbf{x}_0$. Training-free guidance methods therefore rely on approximating
+$\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)$, but the measurement-alignment term is generally intractable because it requires marginalizing over the unknown clean sample $\mathbf{x}_0$. Training-free guidance methods therefore rely on approximating
 $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)$.
 Once an approximation of the posterior score is available, it can be substituted into the reverse SDE to guide the reverse diffusion process toward the posterior distribution.
 
@@ -1178,3 +1169,4 @@ plot_reverse_samples(
 Compared to DPS, TDS gives a much better approximation of the posterior distribution, and the critical statistician is likely happier with the result.
 
 Thank you for reading! If you have any questions or comments, feel free to reach out.
+
