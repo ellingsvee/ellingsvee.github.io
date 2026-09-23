@@ -1,8 +1,8 @@
 ---
-title: "Sampling with Conditional Diffusion Models"
-author: "Elling Svee"
-date: 2026-09-22
-date-format: "MMMM D, YYYY"
+title: Posterior Sampling with Conditional Diffusion Models
+author: Elling Svee
+date: '2026-09-22'
+date-format: MMMM D, YYYY
 bibliography: ../refs.bib
 jupyter: python3
 execute:
@@ -10,7 +10,7 @@ execute:
   warning: false
 ---
 
-Many problems in science and engineering are inverse problems. We observe indirect or corrupted measurements and want to recover the unknown quantity that generated them. Examples include recovering a signal from incomplete observations, or inferring physical parameters from experimental data. These problems are often ill-posed, meaning that many different solutions may be consistent with the observations.  A natural way to handle this ambiguity is through Bayesian inference. Let $x$ denote the unknown quantity and $y$ the observed data. Bayes' rule gives
+Many problems in science and engineering are inverse problems. We observe indirect or corrupted measurements and want to recover the unknown quantity that generated them. Examples include recovering a signal from incomplete observations, or inferring physical parameters from experimental data. These problems are often ill-posed, meaning that many different solutions may be consistent with the observations.  A natural way to handle this ambiguity is through Bayesian inference. Let $\boldsymbol{x}$ denote the unknown quantity and $\boldsymbol{y}$ the observed data. Bayes' rule gives
 
 $$
 p(\boldsymbol{x} \mid \boldsymbol{y}) \propto p(\boldsymbol{y} \mid \boldsymbol{x})\,p(\boldsymbol{x}),
@@ -22,7 +22,7 @@ where:
 * Likelihood $p(\boldsymbol{y} \mid \boldsymbol{x})$: describes the measurement process and how well a candidate $\boldsymbol{x}$ explains the observations.
 * Posterior $p(\boldsymbol{x} \mid \boldsymbol{y})$: combines both sources of information and represents our uncertainty about $\boldsymbol{x}$ after observing $\boldsymbol{y}$.
 
-The challenge is that useful priors for high-dimensional objects are difficult to specify explicitly. Generative diffusion models provide an attractive alternative. Here, a diffusion model trained on representative data can act as a powerful learned prior. Instead of restricting solutions using a hand-designed regularizer, the model captures complex structure directly from data. By combining this learned prior with the likelihood during the diffusion sampling process, we can approximately sample from the posterior without retraining the generative model for every new inverse problem.
+The challenge is that useful priors for high-dimensional objects are difficult to specify explicitly. Generative diffusion models provide an attractive alternative. Here, a diffusion model trained on representative data can act as a learned prior. Instead of restricting solutions using a hand-designed regularizer, the model captures complex structure directly from data. By combining this learned prior with the likelihood during the diffusion sampling process, we can approximately sample from the posterior without retraining the generative model for every new inverse problem.
 
 Benefits of using diffusion models as priors include:
 
@@ -32,22 +32,35 @@ Benefits of using diffusion models as priors include:
 
 However, compared to approaches like MCMC or variational inference, there are also some limitations:
 
-* Computational cost: Posterior sampling may require many neural-network evaluations. There are ways to reduce this, like flow-based methods, but this is not discussed here.
-* Approximate inference: Methods such as DPS generally do not produce exact posterior samples and may introduce bias. We will explore ways to handle this.
+* Computational cost: Posterior sampling may require many neural-network evaluations. There are ways to reduce this, like flow-based methods, but this is not discussed here. Scaling to very high-dimensional problems may also require additional techniques, such as generating lower-dimensional latent representations, to make the problem tractable.
+* Approximate inference: Methods such as DPS generally do not produce exact posterior samples and may introduce bias. However, we will explore ways to address this.
 * Prior mismatch: If the true solution differs substantially from the diffusion model's training distribution, the prior can lead to misleading reconstructions.
 * Limited interpretability: A learned generative prior is harder to understand and analyze than simple analytical priors.
 
+This post gives an overview of the main ideas behind diffusion models, and how they can be used for posterior sampling in inverse problems. We rely on the *score-based diffusion* framework for a clean theoretical foundation [@song_score_based_2021], and our notation and explanations are inspired by a book called *The Principles of Diffusion Models* [@lai_principles_2025].
 
 ```{python}
-import matplotlib.pyplot as plt
+from typing import Callable, NamedTuple
 
+import jax.numpy as jnp
+import jax.random as random
+import jax.scipy.stats as stats
+import optax
+from flax import nnx
+from jax import Array, grad, vmap
+from jax.nn import softmax
+import matplotlib.pyplot as plt
+```
+
+```{python}
+# Style and color settings for plots
 plt.style.use("tableau-colorblind10")
 plt.rcParams.update(
     {
         "text.usetex": False,
         "font.family": "monospace",
         "font.monospace": ["Lucida Console", "DejaVu Sans Mono"],
-        "font.size": 12,
+        "font.size": 14,
         "mathtext.fontset": "custom",
         "mathtext.rm": "DejaVu Sans Mono",
         "mathtext.it": "DejaVu Sans Mono:italic",
@@ -64,19 +77,6 @@ PLOT_COLORS = {
     "loss": "black",
 }
 COLORBAR_PAD = 0.02
-```
-
-```{python}
-from dataclasses import dataclass
-from typing import Callable, NamedTuple
-
-import jax.numpy as jnp
-import jax.random as random
-import jax.scipy.stats as stats
-import optax
-from flax import nnx
-from jax import Array, grad, vmap
-from jax.nn import softmax
 ```
 
 # Problem setup
@@ -201,20 +201,20 @@ likelihood = likelihood_density(grid, observation, observation_std)
 posterior_density = mixture_density(grid, posterior_mixture)
 
 fig, ax = plt.subplots(figsize=(10, 6))
-ax.plot(grid, prior_density, label="Prior", color=PLOT_COLORS["prior"], linewidth=5)
+ax.plot(grid, prior_density, label="Prior", color=PLOT_COLORS["prior"], linewidth=3)
 ax.plot(
     grid,
     likelihood,
     label="Likelihood",
     color=PLOT_COLORS["likelihood"],
-    linewidth=5,
+    linewidth=3,
 )
 ax.plot(
     grid,
     posterior_density,
     label="Posterior",
     color=PLOT_COLORS["posterior"],
-    linewidth=5,
+    linewidth=3,
 )
 ax.set(xlabel="State", ylabel="Density")
 ax.legend()
@@ -238,7 +238,7 @@ $$
 \mathbf{f}(\mathbf{x},t)=-\frac{1}{2}\beta(t)\mathbf{x},
 \qquad g(t)=\sqrt{\beta(t)},
 $$
-with a linear schedule $\beta(t)=\beta_{\min}+\frac{t}{T}(\beta_{\max}-\beta_{\min})$ for some $0<\beta_{\min}<\beta_{\max}$. At the end of the forward process, the distribution of $\mathbf{x}(T) \approx \mathcal{N}(0,I)$, regardless of the initial distribution $p_0$.  Discretizing @eq-forward-sde with the Euler--Maruyama method for a small time step $\Delta t$ gives the update rule
+with a linear schedule $\beta(t)=\beta_{\min}+\frac{t}{T}(\beta_{\max}-\beta_{\min})$ for some $0<\beta_{\min}<\beta_{\max}$. At the end of the forward process, the distribution of $\mathbf{x}(T) \sim p_T \approx \mathcal{N}(0,I)$, regardless of the initial distribution $p_0$.  Discretizing @eq-forward-sde with the Euler--Maruyama method for a small time step $\Delta t$ gives the update rule
 
 $$
 \mathbf{x}_{t+\Delta t}
@@ -246,13 +246,19 @@ $$
 +\sqrt{\beta(t)\Delta t}\,\boldsymbol{\epsilon}_t,
 \qquad \boldsymbol{\epsilon}_t\sim\mathcal{N}(0,I).
 $$
-Although the proof is not provided here, we can also derive the distribution of $\mathbf{x}_t\mid\mathbf{x}_0$ as
+Although the proof is not provided here, we can also derive the distribution of $\mathbf{x}_t\mid\mathbf{x}_0$. Denoting
+$$
+\alpha_t = \exp\!\left(-\frac{1}{2}\int_0^t\beta(\tau)\,\mathrm{d}\tau\right)
+\quad\text{and}\quad
+\sigma_t^2 = 1-\alpha_t^2,
+$$
+the Gaussian corruption kernel can be expressed as $\mathbf{x}_t = \alpha_t\mathbf{x}_0 + \sigma_t\boldsymbol{\epsilon}$ with $\boldsymbol{\epsilon}\sim\mathcal{N}(0,I)$, which gives the conditional distribution
 $$
 p_t(\mathbf{x}_t\mid\mathbf{x}_0)
 =\mathcal{N}\!\left(
 \mathbf{x}_t;
-\mathbf{x}_0 e^{-\frac{1}{2}\int_0^t\beta(\tau)\,\mathrm{d}\tau},
-\mathbf{I}-\mathbf{I}e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}
+\alpha_{t}\mathbf{x}_0,
+\sigma_t^2\mathbf{I}
 \right).
 $$ {#eq-forward-conditional}
 
@@ -430,7 +436,7 @@ $$
 \end{aligned}
 $$ {#eq-reverse-sde}
 
-Here $\widetilde{\mathbf{w}}(t)$ denotes a standard Wiener process in reverse time, defined as $\widetilde{\mathbf{w}}(t)=\mathbf{w}(T-t)-\mathbf{w}(T)$.  Those familiar with MCMC might also notice the similarity to Langevin dynamics used in the MALA alghorithm [@dunson_hastings_2020], where the score function $\nabla_{\mathbf{x}}\log p_t$ is used to guide the process towards regions of high probability.  Discretizing @eq-reverse-sde in a similar manner as for the forward process yields the stochastic updates
+Here $\widetilde{\mathbf{w}}(t)$ denotes a standard Wiener process in reverse time, defined as $\widetilde{\mathbf{w}}(t)=\mathbf{w}(T-t)-\mathbf{w}(T)$.  Those familiar with MCMC might also notice the similarity to Langevin dynamics used in the MALA algorithm [@dunson_hastings_2020], where the score function $\nabla_{\mathbf{x}}\log p_t$ is used to guide the process towards regions of high probability.  Discretizing @eq-reverse-sde in a similar manner as for the forward process yields the stochastic updates
 
 $$
 \begin{aligned}
@@ -500,7 +506,7 @@ plot_reverse_samples(
 )
 ```
 
-However, in practice we do not have access to the score function and must instead learn it from data. This is done by training a neural-network approximation $\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x},t)\approx\nabla_{\mathbf{x}}\log p_t(\mathbf{x})$ to minimize the objective
+<!-- However, in practice we do not have access to the score function and must instead learn it from data. This is done by training a neural-network approximation $\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x},t)\approx\nabla_{\mathbf{x}}\log p_t(\mathbf{x})$ to minimize the objective
 
 $$
 \mathcal{L}(\boldsymbol{\theta})
@@ -550,7 +556,97 @@ $$
 $$
 
 
-In the following code, we learn the score function using a simple multilayer perceptron with two hidden layers. The neural network is implemented in JAX using the Flax library and trained using the Adam optimizer from Optax.
+In the following code, we learn the score function using a simple multilayer perceptron with two hidden layers. The neural network is implemented in JAX using the Flax library and trained using the Adam optimizer from Optax. -->
+
+However, in practice we do not have access to the score function and must instead learn it from data. This is done by training a neural-network approximation
+$\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x},t)\approx\nabla_{\mathbf{x}}\log p_t(\mathbf{x})$
+to minimize the objective
+
+$$
+\mathcal{L}_{\mathrm{SM}}(\boldsymbol{\theta})
+=
+\frac{1}{2}
+\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_t\sim p_t}
+\left[
+\left\|
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+-
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)
+\right\|_2^2
+\right].
+$$
+
+Since the marginal score
+$\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)$
+is generally intractable, we instead rely on the conditional score
+$\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)$,
+which is known analytically from @eq-forward-conditional. In particular, minimizing the *denoising score matching* objective
+
+$$
+\mathcal{L}_{\mathrm{DSM}}(\boldsymbol{\theta})
+=
+\frac{1}{2}
+\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_0}
+\mathbb{E}_{\mathbf{x}_t\sim p_t(\mathbf{x}_t\mid\mathbf{x}_0)}
+\left[
+\left\|
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+-
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)
+\right\|_2^2
+\right]
+$$
+
+has the same minimizer as the original score-matching objective, up to a term that is independent of $\boldsymbol{\theta}$.
+
+Rather than learning the score function directly, it is common to parameterize the model in terms of the noise added by the forward process. In practice, this is often more stable and easier to optimize. For this Gaussian corruption kernel, the conditional score is
+
+$$
+\begin{aligned}
+\nabla_{\mathbf{x}_t}
+\log p_t(\mathbf{x}_t\mid\mathbf{x}_0)
+=
+-\frac{\mathbf{x}_t-\alpha_t\mathbf{x}_0}{\sigma_t^2}
+=
+-\frac{\boldsymbol{\epsilon}}{\sigma_t}.
+\end{aligned}
+$$
+
+Consequently, a noise-prediction network
+$\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)$
+induces the score parameterization
+
+$$
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+=
+-\frac{1}{\sigma_t}
+\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t).
+$$
+
+Substituting this parameterization into the denoising score-matching objective gives
+
+$$
+\mathcal{L}_{\mathrm{DSM}}(\boldsymbol{\theta})
+=
+\frac{1}{2}
+\mathbb{E}_{t\sim\mathcal{U}[0,T]}
+\mathbb{E}_{\mathbf{x}_0}
+\mathbb{E}_{\boldsymbol{\epsilon}\sim\mathcal{N}(\mathbf{0},\mathbf{I})}
+\left[
+\frac{1}{\sigma_t^2}
+\left\|
+\boldsymbol{\epsilon}_{\boldsymbol{\theta}}
+\left(
+\alpha_t\mathbf{x}_0+\sigma_t\boldsymbol{\epsilon},t
+\right)
+-
+\boldsymbol{\epsilon}
+\right\|_2^2
+\right].
+$$
+In the following code, we learn the score function through this noise-prediction parameterization using a simple multilayer perceptron with two hidden layers. The neural network is implemented in JAX using the Flax library and trained using the Adam optimizer from Optax.
 
 ```{python}
 class MLP(nnx.Module):
@@ -671,66 +767,103 @@ Again, we see that the learned prior distribution matches the ground truth very 
 
 ## Sampling from the posterior using training-free guidance
 
-Traditional guidance methods for diffusion models rely on training a separate conditional model to learn the posterior distribution. However, we want to use the learned generative model for the prior directly. Such a *training-free* approach means we avoid the need to retrain a model when we change the conditioning information.
+Traditional guidance methods for diffusion models rely on training a separate conditional model to learn the posterior distribution. However, we want to use the learned generative model for the prior directly. Such a *training-free* approach means that we avoid the need to retrain the model when the conditioning information changes.
 
-To understand how we can use the learned prior model to sample from the posterior, we can decompose the posterior score using Bayes' rule:
+To understand how we can use the learned prior model to sample from the posterior, we decompose the posterior score using Bayes' rule:
 
 $$
-\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}\mid\mathbf{y})
-=\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x})}_{\text{Prior score}}
-+\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)}_{\text{Measurement alignment}}.
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t\mid\mathbf{y})
+=
+\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)}_{\text{Prior score}}
++
+\underbrace{\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)}_{\text{Measurement alignment}}.
 $$ {#eq-posterior-score}
 
-The prior score is what we have already approximated using $\mathbf{s}_{\boldsymbol{\theta}}(\cdot,t)$, but the measurement alignment is intractable because it requires marginalizing over the latent variables. As a result, training-free approaches rely on approximating $\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)$. Having approximated the posterior score, we can then use it in the reverse SDE to guide the reverse diffusion process towards the posterior distribution.
+The prior score is what we have already approximated using
+$\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)$, or equivalently through the noise-prediction parameterization
+
+$$
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+=
+-\frac{1}{\sigma_t}
+\boldsymbol{\epsilon}_{\boldsymbol{\theta}}(\mathbf{x}_t,t).
+$$
+
+The measurement-alignment term is generally intractable because it requires marginalizing over the unknown clean sample $\mathbf{x}_0$. Training-free guidance methods therefore rely on approximating
+$\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)$.
+Once an approximation of the posterior score is available, it can be substituted into the reverse SDE to guide the reverse diffusion process toward the posterior distribution.
 
 ### Diffusion Posterior Sampling
 
-The most common training-free guidance is *Diffusion Posterior Sampling* (DPS) [@chung_diffusion_2024]. It approximates the measurement alignment by assuming the conditional distribution $p(\mathbf{x}_0\mid\mathbf{x}_t)$ is sharply concentrated around its mean. In this case,
+A commonly used training-free guidance method is *Diffusion Posterior Sampling* (DPS) [@chung_diffusion_2024]. DPS approximates the measurement alignment by assuming that the conditional distribution
+$p(\mathbf{x}_0\mid\mathbf{x}_t)$
+is concentrated around its conditional mean. We have
 
 $$
 \begin{aligned}
 p_t(\mathbf{y}\mid\mathbf{x}_t)
-&=\int p_t(\mathbf{y}\mid\mathbf{x}_t,\mathbf{x}_0)
-p(\mathbf{x}_0\mid\mathbf{x}_t)\,\mathrm{d}\mathbf{x}_0\\
-&=\int p_t(\mathbf{y}\mid\mathbf{x}_0)
-p(\mathbf{x}_0\mid\mathbf{x}_t)\,\mathrm{d}\mathbf{x}_0
-\approx p_t(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_t)),
+=
+\int
+p(\mathbf{y}\mid\mathbf{x}_t,\mathbf{x}_0)
+p(\mathbf{x}_0\mid\mathbf{x}_t)
+\,\mathrm{d}\mathbf{x}_0
+=
+\int
+p(\mathbf{y}\mid\mathbf{x}_0)
+p(\mathbf{x}_0\mid\mathbf{x}_t)
+\,\mathrm{d}\mathbf{x}_0
+\approx
+p\left(
+\mathbf{y}
+\mid
+\widehat{\mathbf{x}}_0(\mathbf{x}_t)
+\right).
 \end{aligned}
 $$
 
-with $\widehat{\mathbf{x}}_0(\mathbf{x}_t)=\mathbb{E}[\mathbf{x}_0\mid\mathbf{x}_t]$, giving
-$\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)
-\approx\nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_t))$.
-The $\widehat{\mathbf{x}}_0$ term is computable using Tweedie's formula, where
-
+where $\widehat{\mathbf{x}}_0(\mathbf{x}_t) = \mathbb{E}[\mathbf{x}_0\mid\mathbf{x}_t]$ is approximated using Tweedie's formula
 $$
 \widehat{\mathbf{x}}_0(\mathbf{x}_t)
-=\mathbb{E}[\mathbf{x}_0\mid\mathbf{x}_t]
-=\mathbf{x}_t+
-\left(1-e^{-\int_0^t\beta(\tau)\,\mathrm{d}\tau}\right)
-\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t).
+=
+\frac{1}{\alpha_t}
+\left(
+\mathbf{x}_t
++
+\sigma_t^2
+\nabla_{\mathbf{x}_t}\log p_t(\mathbf{x}_t)
+\right)
+\approx
+\frac{1}{\alpha_t}
+\left(
+\mathbf{x}_t
++
+\sigma_t^2
+\mathbf{s}_{\boldsymbol{\theta}}(\mathbf{x}_t,t)
+\right).
 $$
-
-Assuming we have a (possibly nonlinear) observation operator
-
-$$
-\mathbf{y}=\mathcal{A}(\mathbf{x}_0)+\boldsymbol{\eta},
-\qquad \boldsymbol{\eta}\sim\mathcal{N}(\mathbf{0},\sigma_e^2\mathbf{I}),
-$$
-
-the measurement alignment can be approximated as
-
+Assume that the observations are generated by a possibly nonlinear observation operator $\mathbf{y} = \mathcal{A}(\mathbf{x}_0) + \boldsymbol{\eta}$ where $\boldsymbol{\eta} \sim \mathcal{N}(\mathbf{0},\sigma_e^2\mathbf{I})$. The likelihood is therefore $p(\mathbf{y}\mid\mathbf{x}_0) = \mathcal{N}\left( \mathbf{y}; \mathcal{A}(\mathbf{x}_0), \sigma_e^2\mathbf{I} \right)$, and using the DPS approximation the measurement-alignment term becomes
 $$
 \begin{aligned}
 \nabla_{\mathbf{x}_t}\log p_t(\mathbf{y}\mid\mathbf{x}_t)
-\approx \nabla_{\mathbf{x}_t}\log
-\mathcal{N}(\mathbf{y};\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t)),\sigma_e^2\mathbf{I})
-=-\frac{1}{2\sigma_e^2}\nabla_{\mathbf{x}_t}
-\left\|\mathbf{y}-\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t))\right\|_2^2.
+\approx
+\nabla_{\mathbf{x}_t}
+\log
+\mathcal{N}\left(
+\mathbf{y};
+\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t)),
+\sigma_e^2\mathbf{I}
+\right)
+=
+-\frac{1}{2\sigma_e^2}
+\nabla_{\mathbf{x}_t}
+\left\|
+\mathbf{y}
+-
+\mathcal{A}(\widehat{\mathbf{x}}_0(\mathbf{x}_t))
+\right\|_2^2.
 \end{aligned}
 $$
-
-Substituting this into @eq-posterior-score gives an approximation of the posterior score. Using this score in @eq-reverse-discrete gives a single reverse diffusion trajectory that moves towards the posterior distribution. The following code performs this guided sampling and compares the learned and true posterior distributions.
+Substituting this approximation for the measurement alignment term into the posterior-score decomposition gives an approximation of the posterior score. Using this in the discretized reverse SDE gives a single reverse diffusion trajectory that is guided toward the posterior distribution. The following code performs this guided sampling and compares the learned and true posterior distributions.
 
 ```{python}
 def tweedie_mean(
@@ -823,8 +956,8 @@ A naive SMC sampler would propagate the particles using the full unconditional r
 $$
 \begin{aligned}
 \psi_i(\mathbf{x}_i)
-&:=p(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_i))\\
-&\approx p(\mathbf{y}\mid\mathbf{x}_i)
+:=p(\mathbf{y}\mid X_0=\widehat{\mathbf{x}}_0(\mathbf{x}_i))
+\approx p(\mathbf{y}\mid\mathbf{x}_i)
 =\int p(\mathbf{y}\mid\mathbf{x}_0)
 p(\mathbf{x}_0\mid\mathbf{x}_i)\,\mathrm{d}\mathbf{x}_0,
 \end{aligned}
@@ -840,7 +973,7 @@ $$
 +\nabla_{\mathbf{x}_i}\log\psi_i(\mathbf{x}_i).
 $$ {#eq-tds-score}
 
-Substituting this into the discretized reverse SDE from @eq-reverse-discrete gives a proposal $q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})$ which pushes particles towards states that are both likely under the learned prior and compatible with the observations. The crucial difference from DPS is that TDS corrects for sampling from $q_i$ rather than from the original reverse transition. By initializing
+Substituting this into the discretized reverse SDE from @eq-reverse-discrete gives a proposal $q_i(\cdot\mid\mathbf{x}_{i+1},\mathbf{y})$ which pushes particles towards states that are both likely under the learned prior and compatible with the observations. The crucial difference from DPS is that TDS corrects for sampling from $q_i$ rather than from the original reverse transition. By initializing
 
 $$
 \mathbf{x}_N^k\overset{\mathrm{iid}}{\sim}p_T,
@@ -888,17 +1021,17 @@ The role of the correction in @eq-tds-weight can be seen by multiplying the prop
 
 $$
 \begin{aligned}
-&p(\mathbf{x}_N)\psi_N(\mathbf{x}_N)
+p(\mathbf{x}_N)\psi_N(\mathbf{x}_N)
 \prod_{i=0}^{N-1}
 \left[
-p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})
+q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})
 \frac{
-q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})\psi_i(\mathbf{x}_i)
+p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})\psi_i(\mathbf{x}_i)
 }{
 q_i(\mathbf{x}_i\mid\mathbf{x}_{i+1},\mathbf{y})\psi_{i+1}(\mathbf{x}_{i+1})
 }
-\right]\\
-&\qquad =p(\mathbf{x}_N)
+\right]
+=p(\mathbf{x}_N)
 \prod_{i=0}^{N-1}p_{\boldsymbol{\theta}}(\mathbf{x}_i\mid\mathbf{x}_{i+1})
 p(\mathbf{y}\mid\mathbf{x}_0).
 \end{aligned}
